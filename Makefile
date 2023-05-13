@@ -35,7 +35,7 @@ endif
 
 # keep standard at C11 and C++11
 CFLAGS   = -I.              -O3 -std=c11   -fPIC
-CXXFLAGS = -I. -I./examples -O3 -std=c++11 -fPIC
+CXXFLAGS = -I. -I./examples -O3 -std=c++11 -fPIC -ggdb
 LDFLAGS  =
 
 ifndef LLAMA_DEBUG
@@ -194,7 +194,7 @@ libllama.so: llama.o ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -vf *.o main quantize quantize-stats perplexity embedding benchmark-matmult save-load-state build-info.h
+	rm -vf *.o main quantize quantize-stats perplexity embedding benchmark-matmult save-load-state interactive-beam build-info.h
 
 #
 # Examples
@@ -219,6 +219,9 @@ embedding: examples/embedding/embedding.cpp build-info.h ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 save-load-state: examples/save-load-state/save-load-state.cpp build-info.h ggml.o llama.o common.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
+interactive-beam: examples/interactive-beam/interactive-beam.cpp build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 build-info.h: $(wildcard .git/index) scripts/build-info.sh

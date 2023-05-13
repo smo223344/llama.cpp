@@ -1,0 +1,8 @@
+set(TARGET interactive-beeam)
+add_executable(${TARGET} interactive-beam.cpp)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_11)
+target_include_directories(${TARGET} PRIVATE .. ../..)
+if(TARGET BUILD_INFO)
+  add_dependencies(${TARGET} BUILD_INFO)
+endif()
