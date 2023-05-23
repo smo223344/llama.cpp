@@ -1,10 +1,13 @@
-#include "common.h"
-#include "llama.h"
+#include "../common.h"
 #include "build-info.h"
 
 #include <vector>
 #include <cstdio>
 #include <chrono>
+#include <queue>
+#include <string>
+#include <fstream>
+#include <algorithm>
 
 gpt_params params;
 llama_context_params lparams;
@@ -14,9 +17,13 @@ struct state_stack_entry
     uint8_t * state_mem;
     size_t state_size;
     int n_past;
+    std::string text;
+    int depth;
+    float prob_sum;
 };
 
 std::vector<state_stack_entry> llama_state_stack;
+std::queue<state_stack_entry> llama_state_queue;
 
 void llama_push_state(llama_context * ctx, int n_past)
 {
@@ -29,14 +36,52 @@ void llama_push_state(llama_context * ctx, int n_past)
 void llama_pop_state(llama_context * ctx, int& n_past)
 {
     state_stack_entry stack_entry = llama_state_stack.back();
-    
-//    llama_free(ctx);
-//    ctx = llama_init_from_file(params.model.c_str(), lparams);
-
     llama_set_state_data(ctx, stack_entry.state_mem);
     n_past = stack_entry.n_past;
     llama_state_stack.pop_back();
     delete[] stack_entry.state_mem;
+}
+
+void llama_queue_state(llama_context * ctx, int n_past, const std::string& text, int depth, float prob_sum)
+{
+    const size_t state_size = llama_get_state_size(ctx);
+    uint8_t * state_mem = new uint8_t[state_size];
+    llama_copy_state_data(ctx, state_mem);
+    llama_state_queue.push({state_mem, state_size, n_past, text, depth, prob_sum});
+}
+
+void llama_dequeue_state(llama_context * ctx, int& n_past, std::string& text, int& depth, float& prob_sum)
+{
+    state_stack_entry stack_entry = llama_state_queue.front();
+    llama_set_state_data(ctx, stack_entry.state_mem);
+    n_past = stack_entry.n_past;
+    text = stack_entry.text;
+    depth = stack_entry.depth;
+    prob_sum = stack_entry.prob_sum;
+    llama_state_queue.pop();
+    delete[] stack_entry.state_mem;
+}
+
+// trim the queue by removing the bottom entries based on prob_sum if there are more than max_width entries
+void llama_queue_trim(int max_width)
+{
+    if (llama_state_queue.size() > max_width)
+    {
+        std::vector<state_stack_entry> queue_entries;
+        queue_entries.reserve(llama_state_queue.size());
+        while (!llama_state_queue.empty())
+        {
+            queue_entries.push_back(llama_state_queue.front());
+            llama_state_queue.pop();
+        }
+        std::sort(queue_entries.begin(), queue_entries.end(), [](const state_stack_entry& a, const state_stack_entry& b) {
+            return a.prob_sum > b.prob_sum;
+        });
+        for (int i = 0; i < max_width; i++)
+        {
+            llama_state_queue.push(queue_entries[i]);
+        }
+    }
 }
 
 struct beam_result
@@ -48,7 +93,7 @@ struct beam_result
 
 std::vector<beam_result> beam_results;
 
-void recurse_beam_search(llama_context * ctx, int n_past, int beam_width, int prob_sum, int current_depth, int max_depth, std::string text)
+void recurse_beam_search(llama_context * ctx, int n_past, int beam_width, float prob_sum, int current_depth, int max_depth, std::string text)
 {
     auto logits = llama_get_logits(ctx);
     auto n_vocab = llama_n_vocab(ctx);
@@ -61,31 +106,147 @@ void recurse_beam_search(llama_context * ctx, int n_past, int beam_width, int pr
     llama_sample_softmax(ctx, &candidates_p);
 
     int i = 0;
+    int max_width = 2;
     for (; i < beam_width; i++)
+    {
+        if (candidates_p.data[i].p < 0.1)
+        {
+            max_width = i > max_width ? i : max_width;
+            break;
+        }
+        auto next_token = candidates_p.data[i].id;
+        auto next_token_str = llama_token_to_str(ctx, next_token);
+        printf(" (%.2f) %s\n", prob_sum + candidates_p.data[i].p, (text + next_token_str).c_str());
+    }
+    for (i = 0; i < max_width; i++)
     {
         auto next_token = candidates_p.data[i].id;
         auto next_token_str = llama_token_to_str(ctx, next_token);
         if (current_depth == max_depth || beam_width == 1)
         {
             beam_results.push_back({text + next_token_str, prob_sum + candidates_p.data[i].p, current_depth});
-            printf(" (%0.2f) %s\n", prob_sum + candidates_p.data[i].p, (text + next_token_str).c_str());
+//            printf(" (%0.2f) %s\n", prob_sum + candidates_p.data[i].p, (text + next_token_str).c_str());
         } else
         {
             llama_push_state(ctx, n_past);
             llama_eval(ctx, &next_token, 1, n_past, 1);
-            recurse_beam_search(ctx, n_past + 1, beam_width - 1, prob_sum + candidates_p.data[i].p, current_depth + 1, max_depth, text + next_token_str);
+            recurse_beam_search(ctx, n_past + 1, beam_width, prob_sum + candidates_p.data[i].p, current_depth + 1, max_depth, text + next_token_str);
             llama_pop_state(ctx, n_past);
         }
     }
 }
 
+void iterate_beam_search(llama_context * ctx, int n_past, int beam_width, int max_depth, std::string text, float p_threshold)
+{
+    int i = 0;
+    int depth = 1;
+    float prob_sum = 0.0;
+    llama_queue_state(ctx, n_past, text, depth, prob_sum);
+
+    while (!llama_state_queue.empty())
+    {
+        if ((depth > 10) & (depth % 3 == 0))
+        {
+            llama_queue_trim(beam_width);
+        }
+        llama_dequeue_state(ctx, n_past, text, depth, prob_sum);
+
+        auto logits = llama_get_logits(ctx);
+        auto n_vocab = llama_n_vocab(ctx);
+        std::vector<llama_token_data> candidates;
+        candidates.reserve(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+        }
+        llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+        llama_sample_softmax(ctx, &candidates_p);
+
+        bool is_leaf = true;
+        for (i = 0; i < beam_width; i++)
+        {
+            if (candidates_p.data[i].p < p_threshold)
+            {
+                break;
+            }
+            is_leaf = false;
+
+            auto next_token = candidates_p.data[i].id;
+            auto next_token_str = llama_token_to_str(ctx, next_token);
+            printf(" (%.2f) %s\n", prob_sum + candidates_p.data[i].p, (text + next_token_str).c_str());
+            if (depth == max_depth || is_leaf)
+            {
+                beam_results.push_back({text + next_token_str, prob_sum + candidates_p.data[i].p, depth});
+            } else
+            {
+                llama_push_state(ctx, n_past);
+                llama_eval(ctx, &next_token, 1, n_past, 12);
+                llama_queue_state(ctx, n_past + 1, text + next_token_str, depth + 1, prob_sum + candidates_p.data[i].p);
+                llama_pop_state(ctx, n_past);
+            }
+        }
+        if (is_leaf)
+        {
+            beam_results.push_back({text, prob_sum, depth});
+        }
+    }
+}
+
+std::string get_best_beam_result()
+{
+    std::string best_text;
+    float best_prob_sum = 0.0;
+    int best_n_tokens = 0;
+    for (auto& beam_result : beam_results)
+    {
+        if (beam_result.prob_sum > best_prob_sum)
+        {
+            best_text = beam_result.text;
+            best_prob_sum = beam_result.prob_sum;
+            best_n_tokens = beam_result.n_tokens;
+        }
+    }
+    return best_text;
+}
+
+void sort_beam_results()
+{
+    std::sort(beam_results.begin(), beam_results.end(), [](const beam_result& a, const beam_result& b) {
+        return a.prob_sum > b.prob_sum;
+    });
+}
+
+void print_beam_results()
+{
+    for (auto& beam_result : beam_results)
+    {
+        printf("(%.2f) =====\n%s\n", beam_result.prob_sum, beam_result.text.c_str());
+    }
+}
+
+std::string load_prompt_from_file(std::string prompt_filename)
+{
+    std::string prompt;
+    std::ifstream prompt_file(prompt_filename);
+    if (prompt_file.is_open())
+    {
+        std::string line;
+        while (std::getline(prompt_file, line))
+        {
+            prompt += line + "\n";
+        }
+
+        prompt_file.close();
+    }
+    return prompt;
+}
+
 int main(int argc, char ** argv) {
-//    gpt_params params;
     params.model = "models/7B/ggml-model-q5_1.bin";
     params.seed = 42;
     params.n_threads = 8;
     params.repeat_last_n = 64;
-    params.prompt = "Once upon a time";
+//    params.prompt = "Once upon a time, there was a doctor named House. House was addicted to";
+    params.prompt = load_prompt_from_file("and_prompt.txt");
 
     if (gpt_params_parse(argc, argv, params) == false) {
         return 1;
@@ -128,81 +289,15 @@ int main(int argc, char ** argv) {
     const size_t state_size = llama_get_state_size(ctx);
     uint8_t * state_mem = new uint8_t[state_size];
 
-    // Save state (rng, logits, embedding and kv_cache) to file
-//    llama_copy_state_data(ctx, state_mem); // could also copy directly to memory mapped file
-
-    // save state (last tokens)
     const auto last_n_tokens_data_saved = std::vector<llama_token>(last_n_tokens_data);
     const auto n_past_saved = n_past; 
 
-    // run
     printf("\n%s", params.prompt.c_str());
+//    recurse_beam_search(ctx, n_past, 2, 0, 0, 60, params.prompt);
+//    iterate_beam_search(ctx, n_past, 8, 60, params.prompt, 0.1);
+    iterate_beam_search(ctx, n_past, 8, 200, "", 0.1);
 
-    recurse_beam_search(ctx, n_past, 4, 0, 0, 6, params.prompt);
-/*
-    for (auto i = 0; i < params.n_predict; i++) {
-        auto logits = llama_get_logits(ctx);
-        auto n_vocab = llama_n_vocab(ctx);
-        std::vector<llama_token_data> candidates;
-        candidates.reserve(n_vocab);
-        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
-        }
-        llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
-        auto next_token = llama_sample_token(ctx, &candidates_p);
-        auto next_token_str = llama_token_to_str(ctx, next_token);
-        last_n_tokens_data.push_back(next_token);
-
-        printf("%s", next_token_str);
-        if (llama_eval(ctx, &next_token, 1, n_past, params.n_threads)) {
-            fprintf(stderr, "\n%s : failed to evaluate\n", __func__);
-            return 1;
-        }
-        n_past += 1;
-    }
-
-    printf("\n\n");
-*/
-    // free old model
-//    llama_free(ctx);
-
-    // load new model
-//    auto ctx2 = llama_init_from_file(params.model.c_str(), lparams);
-/*
-    // Load state (rng, logits, embedding and kv_cache) from file
-    {
-        llama_set_state_data(ctx, state_mem);  // could also read directly from memory mapped file
-    }
-
-    // restore state (last tokens)
-    last_n_tokens_data = last_n_tokens_data_saved;
-    n_past = n_past_saved;
-
-    // second run
-    printf("\n%s", params.prompt.c_str());
-
-    for (auto i = 0; i < params.n_predict; i++) {
-        auto logits = llama_get_logits(ctx);
-        auto n_vocab = llama_n_vocab(ctx);
-        std::vector<llama_token_data> candidates;
-        candidates.reserve(n_vocab);
-        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
-        }
-        llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
-        auto next_token = llama_sample_token(ctx, &candidates_p);
-        auto next_token_str = llama_token_to_str(ctx, next_token);
-        last_n_tokens_data.push_back(next_token);
-
-        printf("%s", next_token_str);
-        if (llama_eval(ctx, &next_token, 1, n_past, params.n_threads)) {
-            fprintf(stderr, "\n%s : failed to evaluate\n", __func__);
-            return 1;
-        }
-        n_past += 1;
-    }
-
-    printf("\n\n");
-*/
+    sort_beam_results();
+    print_beam_results();
     return 0;
 }
